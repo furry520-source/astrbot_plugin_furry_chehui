@@ -19,7 +19,6 @@ class SelfRecallPlugin(Star):
         super().__init__(context)
         self.conf = config
         self.recall_tasks = []
-        # 移除了未使用的 sent_messages 属性
         logger.info(f"自动撤回插件已加载，撤回时间: {self.conf['recall_time']}秒")
 
     def _remove_task(self, task: asyncio.Task):
@@ -85,39 +84,52 @@ class SelfRecallPlugin(Star):
                 self.recall_tasks.append(task)
                 logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回，消息ID: {message_id}")
             else:
-                logger.warning("无法获取有效的消息ID，撤回失败")
+                logger.error("❌ 无法获取有效的消息ID，撤回任务已放弃")
             
         except Exception as e:
             logger.error(f"撤回处理失败: {e}")
 
     def _try_get_message_id(self, event: AstrMessageEvent) -> int:
-        """尝试获取消息ID"""
+        """尝试获取消息ID - 移除无效的哈希生成回退"""
         try:
             # 方法1: 尝试从事件属性获取
             if hasattr(event, 'message_id') and event.message_id:
-                return int(event.message_id)
+                message_id = int(event.message_id)
+                logger.info(f"从 event.message_id 获取消息ID: {message_id}")
+                return message_id
                 
-            # 方法2: 对于AiocqhttpMessageEvent，尝试其他方式
+            # 方法2: 对于AiocqhttpMessageEvent，尝试从原始事件获取
             if isinstance(event, AiocqhttpMessageEvent):
                 # 尝试从原始事件获取
                 if hasattr(event, '_raw_event') and event._raw_event:
                     raw_event = event._raw_event
                     if hasattr(raw_event, 'message_id') and raw_event.message_id:
-                        return int(raw_event.message_id)
-                    # 尝试从原始数据获取
+                        message_id = int(raw_event.message_id)
+                        logger.info(f"从 _raw_event.message_id 获取消息ID: {message_id}")
+                        return message_id
+                    # 尝试从原始数据字典获取
                     if hasattr(raw_event, 'get') and callable(raw_event.get):
-                        return int(raw_event.get('message_id', 0))
+                        message_id = int(raw_event.get('message_id', 0))
+                        if message_id:
+                            logger.info(f"从 _raw_event.get('message_id') 获取消息ID: {message_id}")
+                            return message_id
                 
-                # 方法3: 尝试访问可能的消息ID属性
+                # 方法3: 尝试访问可能的消息ID方法
                 if hasattr(event, 'get_message_id') and callable(event.get_message_id):
-                    return int(event.get_message_id())
+                    message_id = int(event.get_message_id())
+                    if message_id:
+                        logger.info(f"从 get_message_id() 获取消息ID: {message_id}")
+                        return message_id
                     
-            # 方法4: 使用时间戳生成（最后的手段，可能不可靠）
-            logger.warning("使用生成的消息ID，可能无法正确撤回")
-            return hash(f"recall_{event.unified_msg_origin}_{event.timestamp}")
+            # 如果所有方法都失败，返回0表示无法获取有效消息ID
+            logger.warning("所有消息ID获取方法都失败了")
+            return 0
             
+        except (ValueError, TypeError) as e:
+            logger.error(f"消息ID格式转换失败: {e}")
+            return 0
         except Exception as e:
-            logger.error(f"获取消息ID失败: {e}")
+            logger.error(f"获取消息ID过程中发生未知错误: {e}")
             return 0
 
     # 测试命令 - 验证所有消息撤回
