@@ -2,7 +2,6 @@ import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -11,7 +10,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 @register(
     "astrbot_plugin_furry_chehui",
     "芝士雪豹", 
-    "机器人定时撤回所有自己消息的插件",
+    "机器人定时撤回自己消息的插件",
     "1.0.0",
     "https://github.com/furry520-source/astrbot_plugin_furry_chehui",
 )
@@ -27,7 +26,7 @@ class SelfRecallPlugin(Star):
         self.recall_tasks.discard(task)
 
     async def _recall_msg(self, client, message_id: int):
-        """撤回消息"""
+        """撤回消息 - 参考其他插件的写法"""
         recall_time = self.conf["recall_time"]
         logger.info(f"⏰ 等待 {recall_time} 秒后撤回消息 {message_id}")
         
@@ -36,8 +35,6 @@ class SelfRecallPlugin(Star):
             if message_id and message_id != 0:
                 await client.delete_msg(message_id=message_id)
                 logger.info(f"✅ 已自动撤回消息: {message_id}")
-            else:
-                logger.warning("消息ID无效，跳过撤回")
         except Exception as e:
             logger.error(f"撤回消息失败: {e}")
 
@@ -56,8 +53,8 @@ class SelfRecallPlugin(Star):
         return self.conf.get("enable_group_recall", True)
 
     @filter.on_decorating_result(priority=999)
-    async def intercept_all_bot_messages(self, event: AstrMessageEvent):
-        """拦截所有机器人消息，重新发送并安排撤回"""
+    async def intercept_and_recall(self, event: AstrMessageEvent):
+        """拦截消息并安排撤回 - 参考其他插件的模式"""
         try:
             # 检查是否启用撤回
             if not self._should_enable_recall(event):
@@ -83,48 +80,60 @@ class SelfRecallPlugin(Star):
             # 清空原消息链，阻止框架自动发送
             result.chain.clear()
             
-            # 重新发送消息并安排撤回
-            await self._resend_and_schedule_recall(event, original_chain, recall_time)
+            # 使用 event.send() 发送消息并获取发送结果
+            send_result = None
+            if group_id := event.get_group_id():
+                # 使用 event.send() 而不是直接调用 client
+                from astrbot.core.message.message_event_result import MessageChain
+                message_chain = MessageChain(chain=original_chain)
+                send_result = await event.send(message_chain)
+            elif user_id := event.get_sender_id():
+                from astrbot.core.message.message_event_result import MessageChain
+                message_chain = MessageChain(chain=original_chain)
+                send_result = await event.send(message_chain)
+
+            # 从发送结果中获取消息ID
+            if send_result and hasattr(send_result, 'message_id'):
+                message_id = send_result.message_id
+                logger.info(f"📤 发送成功，获取到消息ID: {message_id}")
+                
+                # 启动撤回任务
+                task = asyncio.create_task(self._recall_msg(event.bot, int(message_id)))
+                task.add_done_callback(self._remove_task)
+                self.recall_tasks.add(task)
+                logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回")
+            else:
+                logger.error("❌ 发送消息失败，无法获取消息ID")
+                # 备选方案：直接使用 event.send 但不获取消息ID
+                from astrbot.core.message.message_event_result import MessageChain
+                message_chain = MessageChain(chain=original_chain)
+                await event.send(message_chain)
+                logger.warning("使用备选方案发送消息，但无法撤回")
             
         except Exception as e:
             logger.error(f"消息拦截处理失败: {e}")
 
-    async def _resend_and_schedule_recall(self, event: AstrMessageEvent, chain: list, recall_time: int):
-        """重新发送消息并安排撤回任务"""
+    # 备选方案：使用消息历史记录获取消息ID
+    async def _get_recent_bot_messages(self, event: AiocqhttpMessageEvent, count: int = 5):
+        """获取最近的机器人消息 - 参考其他插件的模式"""
         try:
-            client = event.bot
-
-            # 转换为OneBot消息格式
-            obmsg = await event._parse_onebot_json(MessageChain(chain=chain))
+            payloads = {
+                "group_id": int(event.get_group_id()),
+                "count": count,
+            }
+            result = await event.bot.api.call_action("get_group_msg_history", **payloads)
+            messages = result.get("messages", [])
             
-            # 发送消息并获取真实的消息ID
-            send_result = None
-            if group_id := event.get_group_id():
-                send_result = await client.send_group_msg(
-                    group_id=int(group_id), 
-                    message=obmsg
-                )
-                logger.info(f"📤 已发送群消息到群 {group_id}")
-            elif user_id := event.get_sender_id():
-                send_result = await client.send_private_msg(
-                    user_id=int(user_id),
-                    message=obmsg
-                )
-                logger.info(f"📤 已发送私聊消息给用户 {user_id}")
-
-            # 启动撤回任务
-            if send_result and (message_id := send_result.get("message_id")):
-                task = asyncio.create_task(self._recall_msg(client, int(message_id)))
-                task.add_done_callback(self._remove_task)
-                self.recall_tasks.add(task)
-                logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回，消息ID: {message_id}")
-            else:
-                logger.error("❌ 重新发送消息失败，无法获取消息ID")
-                if send_result:
-                    logger.error(f"发送结果: {send_result}")
-                
+            # 过滤出机器人发送的消息
+            bot_messages = [
+                msg for msg in messages 
+                if str(msg.get("sender", {}).get("user_id", "")) == event.get_self_id()
+            ]
+            
+            return bot_messages
         except Exception as e:
-            logger.error(f"重新发送消息失败: {e}")
+            logger.error(f"获取消息历史失败: {e}")
+            return []
 
     # 测试命令
     @filter.command("test_recall")
