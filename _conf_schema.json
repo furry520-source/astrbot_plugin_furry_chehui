@@ -17,10 +17,16 @@
         "hint": "是否启用群聊消息撤回功能",
         "default": true
     },
-    "group_recall_time": {
-        "description": "群聊撤回时间",
+    "admin_recall_time": {
+        "description": "管理员撤回时间",
         "type": "int",
-        "hint": "群聊消息的撤回等待时间（秒）",
+        "hint": "当机器人是群管理员时的撤回时间（秒）",
+        "default": 60
+    },
+    "member_recall_time": {
+        "description": "成员撤回时间",
+        "type": "int",
+        "hint": "当机器人是普通成员时的撤回时间（秒）",
         "default": 30
     },
     "group_whitelist": {
@@ -34,11 +40,5 @@
         "type": "int",
         "hint": "允许设置的最大撤回时间（秒）",
         "default": 600
-    },
-    "admin_only": {
-        "description": "仅管理员可使用",
-        "type": "bool",
-        "hint": "是否只有管理员才能设置撤回时间",
-        "default": true
     }
 }
