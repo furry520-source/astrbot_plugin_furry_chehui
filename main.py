@@ -29,13 +29,15 @@ class SelfRecallPlugin(Star):
     async def _recall_msg(self, client, message_id: int):
         """撤回消息"""
         recall_time = self.conf["recall_time"]
-        logger.info(f"等待 {recall_time} 秒后撤回消息 {message_id}")
+        logger.info(f"⏰ 等待 {recall_time} 秒后撤回消息 {message_id}")
         
         await asyncio.sleep(recall_time)
         try:
             if message_id and message_id != 0:
                 await client.delete_msg(message_id=message_id)
                 logger.info(f"✅ 已自动撤回消息: {message_id}")
+            else:
+                logger.warning("消息ID无效，跳过撤回")
         except Exception as e:
             logger.error(f"撤回消息失败: {e}")
 
@@ -53,9 +55,9 @@ class SelfRecallPlugin(Star):
             
         return self.conf.get("enable_group_recall", True)
 
-    @filter.on_decorating_result(priority=999)  # 使用高优先级确保最先执行
-    async def intercept_and_resend_all_messages(self, event: AstrMessageEvent):
-        """拦截所有消息，重新发送并安排撤回"""
+    @filter.on_decorating_result(priority=999)
+    async def intercept_all_bot_messages(self, event: AstrMessageEvent):
+        """拦截所有机器人消息，重新发送并安排撤回"""
         try:
             # 检查是否启用撤回
             if not self._should_enable_recall(event):
@@ -72,6 +74,7 @@ class SelfRecallPlugin(Star):
             # 获取原始消息链
             result = event.get_result()
             if not result or not result.chain:
+                logger.warning("消息链为空，跳过处理")
                 return
 
             # 保存原始消息链
@@ -91,18 +94,23 @@ class SelfRecallPlugin(Star):
         try:
             client = event.bot
 
+            # 转换为OneBot消息格式
+            obmsg = await event._parse_onebot_json(MessageChain(chain=chain))
+            
             # 发送消息并获取真实的消息ID
             send_result = None
             if group_id := event.get_group_id():
                 send_result = await client.send_group_msg(
                     group_id=int(group_id), 
-                    message=await event._parse_onebot_json(MessageChain(chain=chain))
+                    message=obmsg
                 )
+                logger.info(f"📤 已发送群消息到群 {group_id}")
             elif user_id := event.get_sender_id():
                 send_result = await client.send_private_msg(
                     user_id=int(user_id),
-                    message=await event._parse_onebot_json(MessageChain(chain=chain))
+                    message=obmsg
                 )
+                logger.info(f"📤 已发送私聊消息给用户 {user_id}")
 
             # 启动撤回任务
             if send_result and (message_id := send_result.get("message_id")):
@@ -112,26 +120,11 @@ class SelfRecallPlugin(Star):
                 logger.info(f"✅ 已安排消息在 {recall_time} 秒后撤回，消息ID: {message_id}")
             else:
                 logger.error("❌ 重新发送消息失败，无法获取消息ID")
+                if send_result:
+                    logger.error(f"发送结果: {send_result}")
                 
         except Exception as e:
             logger.error(f"重新发送消息失败: {e}")
-
-    # 备选方案：对于无法拦截的消息，使用事件传播控制
-    @filter.on_decorating_result(priority=1)  # 低优先级，作为备选
-    async def fallback_recall_handler(self, event: AstrMessageEvent):
-        """备选撤回处理方案"""
-        try:
-            if not self._should_enable_recall(event):
-                return
-                
-            if not isinstance(event, AiocqhttpMessageEvent):
-                return
-
-            # 这里可以添加其他撤回逻辑
-            # 比如对于某些特定类型的消息进行特殊处理
-            
-        except Exception as e:
-            logger.error(f"备选撤回处理失败: {e}")
 
     # 测试命令
     @filter.command("test_recall")
@@ -155,20 +148,6 @@ class SelfRecallPlugin(Star):
             config_info += "白名单群: 所有群聊\n"
             
         yield event.plain_result(config_info)
-
-    # 调试命令
-    @filter.command("recall_debug")
-    async def recall_debug_command(self, event: AstrMessageEvent):
-        """调试撤回功能"""
-        yield event.plain_result("🔧 撤回调试信息:")
-        
-        # 显示当前会话信息
-        session_info = f"平台: {event.get_platform_name()}\n"
-        session_info += f"私聊: {not event.get_group_id()}\n"
-        session_info += f"群ID: {event.get_group_id()}\n"
-        session_info += f"撤回时间: {self.conf['recall_time']}秒\n"
-        
-        yield event.plain_result(session_info)
 
     async def terminate(self):
         """插件卸载时取消所有撤回任务"""
