@@ -57,9 +57,35 @@ class SelfRecallPlugin(Star):
             
         return self.conf.get("enable_group_recall", True)
 
-    @filter.after_message_sent()
-    async def on_all_messages_sent(self, event: AstrMessageEvent):
-        """监听所有消息发送后的事件 - 包括LLM和其他插件的消息"""
+    def _try_get_message_id(self, event: AstrMessageEvent) -> int:
+        """尝试获取消息ID - 使用责任链模式简化逻辑"""
+        # 按照从公共到私有的顺序尝试不同的获取方式
+        potential_getters = [
+            # 1. 优先使用公共接口
+            lambda e: getattr(e, 'get_message_id', lambda: 0)(),
+            # 2. 直接访问 message_id 属性
+            lambda e: getattr(e, 'message_id', 0),
+            # 3. 对于QQ平台，尝试从消息对象获取
+            lambda e: getattr(getattr(e, 'message_obj', None), 'message_id', 0) if isinstance(e, AiocqhttpMessageEvent) else 0,
+        ]
+        
+        for getter in potential_getters:
+            try:
+                result = getter(event)
+                if result and str(result).isdigit() and int(result) != 0:
+                    message_id = int(result)
+                    logger.info(f"成功获取消息ID: {message_id}")
+                    return message_id
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.debug(f"消息ID获取方法失败: {e}")
+                continue
+        
+        logger.warning("所有消息ID获取方法都失败了")
+        return 0
+
+    @filter.on_decorating_result(priority=1)
+    async def on_all_messages_decorating(self, event: AstrMessageEvent):
+        """拦截所有消息的装饰阶段 - 包括LLM和其他插件"""
         try:
             # 检查是否启用撤回
             if not self._should_enable_recall(event):
@@ -71,11 +97,72 @@ class SelfRecallPlugin(Star):
 
             # 获取配置中的撤回时间
             recall_time = self.conf["recall_time"]
-            logger.info(f"🔧 配置撤回时间: {recall_time}秒 - 准备撤回机器人消息")
+            logger.info(f"🎯 拦截到消息，{recall_time}秒后撤回")
+
+            # 获取原始消息链
+            result = event.get_result()
+            if not result or not result.chain:
+                return
+
+            original_chain = result.chain.copy()
+            
+            # 清空原消息链，阻止框架自动发送
+            result.chain.clear()
+            
+            # 重新发送消息并安排撤回
+            await self._resend_and_recall(event, original_chain, recall_time)
+            
+        except Exception as e:
+            logger.error(f"消息装饰处理失败: {e}")
+
+    async def _resend_and_recall(self, event: AstrMessageEvent, chain: list, recall_time: int):
+        """重新发送消息并安排撤回"""
+        try:
+            from astrbot.core.message.message_event_result import MessageChain
+            
+            # 转换为OneBot消息格式
+            obmsg = await event._parse_onebot_json(MessageChain(chain=chain))
+            client = event.bot
+
+            # 发送消息并获取真实的消息ID
+            send_result = None
+            if group_id := event.get_group_id():
+                send_result = await client.send_group_msg(
+                    group_id=int(group_id), message=obmsg
+                )
+            elif user_id := event.get_sender_id():
+                send_result = await client.send_private_msg(
+                    user_id=int(user_id), message=obmsg
+                )
+
+            # 启动撤回任务
+            if send_result and (message_id := send_result.get("message_id")):
+                task = asyncio.create_task(self._recall_msg(client, int(message_id)))
+                task.add_done_callback(self._remove_task)
+                self.recall_tasks.append(task)
+                logger.info(f"✅ 已重新发送并安排 {recall_time} 秒后撤回，消息ID: {message_id}")
+            else:
+                logger.error("重新发送消息失败，无法获取消息ID")
+                
+        except Exception as e:
+            logger.error(f"重新发送消息失败: {e}")
+
+    # 备选方案：使用 after_message_sent 钩子
+    @filter.after_message_sent()
+    async def on_all_messages_sent(self, event: AstrMessageEvent):
+        """监听所有消息发送后的事件"""
+        try:
+            # 检查是否启用撤回
+            if not self._should_enable_recall(event):
+                return
+                
+            if not isinstance(event, AiocqhttpMessageEvent):
+                return
+
+            recall_time = self.conf["recall_time"]
+            logger.info(f"🔧 消息发送后处理，{recall_time}秒后撤回")
 
             client = event.bot
-            
-            # 获取消息ID
             message_id = self._try_get_message_id(event)
             
             if message_id and message_id != 0:
@@ -88,49 +175,6 @@ class SelfRecallPlugin(Star):
             
         except Exception as e:
             logger.error(f"撤回处理失败: {e}")
-
-    def _try_get_message_id(self, event: AstrMessageEvent) -> int:
-        """尝试获取消息ID - 移除无效的哈希生成回退"""
-        try:
-            # 方法1: 尝试从事件属性获取
-            if hasattr(event, 'message_id') and event.message_id:
-                message_id = int(event.message_id)
-                logger.info(f"从 event.message_id 获取消息ID: {message_id}")
-                return message_id
-                
-            # 方法2: 对于AiocqhttpMessageEvent，尝试从原始事件获取
-            if isinstance(event, AiocqhttpMessageEvent):
-                # 尝试从原始事件获取
-                if hasattr(event, '_raw_event') and event._raw_event:
-                    raw_event = event._raw_event
-                    if hasattr(raw_event, 'message_id') and raw_event.message_id:
-                        message_id = int(raw_event.message_id)
-                        logger.info(f"从 _raw_event.message_id 获取消息ID: {message_id}")
-                        return message_id
-                    # 尝试从原始数据字典获取
-                    if hasattr(raw_event, 'get') and callable(raw_event.get):
-                        message_id = int(raw_event.get('message_id', 0))
-                        if message_id:
-                            logger.info(f"从 _raw_event.get('message_id') 获取消息ID: {message_id}")
-                            return message_id
-                
-                # 方法3: 尝试访问可能的消息ID方法
-                if hasattr(event, 'get_message_id') and callable(event.get_message_id):
-                    message_id = int(event.get_message_id())
-                    if message_id:
-                        logger.info(f"从 get_message_id() 获取消息ID: {message_id}")
-                        return message_id
-                    
-            # 如果所有方法都失败，返回0表示无法获取有效消息ID
-            logger.warning("所有消息ID获取方法都失败了")
-            return 0
-            
-        except (ValueError, TypeError) as e:
-            logger.error(f"消息ID格式转换失败: {e}")
-            return 0
-        except Exception as e:
-            logger.error(f"获取消息ID过程中发生未知错误: {e}")
-            return 0
 
     # 测试命令 - 验证所有消息撤回
     @filter.command("test_recall")
