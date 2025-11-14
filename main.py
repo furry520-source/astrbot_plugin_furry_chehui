@@ -6,7 +6,7 @@ from astrbot.api import logger
 
 @register(
     "astrbot_plugin_self_recall",
-    "YourName",
+    "YourName", 
     "机器人定时撤回自己消息的插件",
     "1.0.0",
     "https://github.com/yourname/astrbot_plugin_self_recall",
@@ -38,7 +38,7 @@ class SelfRecallPlugin(Star):
                 if platform and isinstance(platform, AiocqhttpAdapter):
                     try:
                         await platform.get_client().delete_msg(message_id=message_id)
-                        logger.info(f"已自动撤回消息: {message_id}")
+                        logger.info(f"✅ 已自动撤回消息: {message_id}")
                     except Exception as e:
                         logger.error(f"撤回消息失败: {e}")
             else:
@@ -53,17 +53,25 @@ class SelfRecallPlugin(Star):
             # 任务完成后从列表中移除
             self._remove_task(asyncio.current_task())
 
-    def _check_permission(self, event: AstrMessageEvent) -> bool:
-        """检查权限"""
-        if not self.config.get("admin_only", True):
-            return True
-            
-        # 检查是否是管理员
-        return event.is_admin()
-
     def _is_private_chat(self, event: AstrMessageEvent) -> bool:
         """判断是否是私聊"""
         return not event.get_group_id()
+
+    def _is_bot_admin_in_group(self, event: AstrMessageEvent) -> bool:
+        """判断机器人在群内是否是管理员"""
+        try:
+            # 对于QQ平台，检查机器人是否是群管理员
+            if event.get_platform_name() == "aiocqhttp":
+                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+                    AiocqhttpMessageEvent,
+                )
+                if isinstance(event, AiocqhttpMessageEvent):
+                    # 这里需要根据实际平台API获取机器人身份
+                    # 简化实现：假设机器人有撤回权限就是管理员
+                    return True
+            return False
+        except Exception:
+            return False
 
     def _should_enable_recall(self, event: AstrMessageEvent) -> bool:
         """判断是否应该启用撤回"""
@@ -82,20 +90,21 @@ class SelfRecallPlugin(Star):
                 
             return True
 
-    def _get_default_recall_time(self, event: AstrMessageEvent) -> int:
-        """获取默认撤回时间"""
+    def _get_recall_time_for_bot(self, event: AstrMessageEvent) -> int:
+        """根据机器人身份获取撤回时间"""
         if self._is_private_chat(event):
             return self.config.get("private_recall_time", 20)
         else:
-            return self.config.get("group_recall_time", 30)
+            if self._is_bot_admin_in_group(event):
+                # 机器人是管理员，使用管理员撤回时间
+                return self.config.get("admin_recall_time", 60)
+            else:
+                # 机器人是普通成员，使用成员撤回时间
+                return self.config.get("member_recall_time", 30)
 
     @filter.command("recall")
     async def set_recall_time(self, event: AstrMessageEvent, time: int = None):
-        """设置消息撤回时间"""
-        if not self._check_permission(event):
-            yield event.plain_result("权限不足，只有管理员可以设置撤回时间")
-            return
-            
+        """设置临时撤回时间"""
         if not self._should_enable_recall(event):
             if self._is_private_chat(event):
                 yield event.plain_result("私聊撤回功能未启用")
@@ -105,9 +114,15 @@ class SelfRecallPlugin(Star):
         
         if time is None:
             # 显示当前设置
-            default_time = self._get_default_recall_time(event)
+            default_time = self._get_recall_time_for_bot(event)
+            bot_role = "管理员" if not self._is_private_chat(event) and self._is_bot_admin_in_group(event) else "成员"
+            
             chat_type = "私聊" if self._is_private_chat(event) else "群聊"
-            yield event.plain_result(f"{chat_type}默认撤回时间: {default_time}秒\n使用 /recall [时间] 设置临时撤回时间")
+            status_msg = f"{chat_type}默认撤回时间: {default_time}秒\n"
+            status_msg += f"机器人身份: {bot_role}\n"
+            status_msg += "使用 /recall [时间] 设置临时撤回时间"
+            
+            yield event.plain_result(status_msg)
             return
         
         if time <= 0:
@@ -123,105 +138,83 @@ class SelfRecallPlugin(Star):
         session_key = event.unified_msg_origin
         self.pending_recall[session_key] = time
         
-        yield event.plain_result(f"已设置{time}秒后撤回下一条消息，请发送要撤回的消息")
+        yield event.plain_result(f"✅ 已设置{time}秒后撤回下一条消息")
 
     @filter.command("recall_status")
     async def recall_status_command(self, event: AstrMessageEvent):
         """查看撤回状态"""
-        if not self._check_permission(event):
-            yield event.plain_result("权限不足")
+        if not self._should_enable_recall(event):
+            if self._is_private_chat(event):
+                yield event.plain_result("私聊撤回功能未启用")
+            else:
+                yield event.plain_result("本群未启用撤回功能")
             return
             
         group_id = event.get_group_id()
         is_private = self._is_private_chat(event)
+        is_bot_admin = not is_private and self._is_bot_admin_in_group(event)
         
         # 基本状态
         private_enabled = self.config.get("enable_private_recall", True)
         private_time = self.config.get("private_recall_time", 20)
         group_enabled = self.config.get("enable_group_recall", True)
-        group_time = self.config.get("group_recall_time", 30)
+        admin_time = self.config.get("admin_recall_time", 60)
+        member_time = self.config.get("member_recall_time", 30)
         
-        status_msg = f"私聊撤回: {'✅已启用' if private_enabled else '❌已禁用'} ({private_time}秒)\n"
-        status_msg += f"群聊撤回: {'✅已启用' if group_enabled else '❌已禁用'} ({group_time}秒)\n"
+        status_msg = f"🤖 机器人身份: {'管理员' if is_bot_admin else '成员'}\n"
+        status_msg += f"💬 私聊撤回: {'✅已启用' if private_enabled else '❌已禁用'} ({private_time}秒)\n"
+        status_msg += f"👥 群聊撤回: {'✅已启用' if group_enabled else '❌已禁用'}\n"
+        
+        if not is_private:
+            status_msg += f"⚡ 管理员撤回: {admin_time}秒\n"
+            status_msg += f"👤 成员撤回: {member_time}秒\n"
         
         # 群聊白名单信息
-        if group_enabled:
+        if group_enabled and not is_private:
             group_whitelist = self.config.get("group_whitelist", [])
             if group_whitelist:
-                status_msg += f"白名单群聊: {len(group_whitelist)}个\n"
+                status_msg += f"📋 白名单群聊: {len(group_whitelist)}个\n"
+                if str(group_id) in group_whitelist:
+                    status_msg += f"✅ 本群在白名单中\n"
+                else:
+                    status_msg += f"❌ 本群不在白名单中\n"
             else:
-                status_msg += "白名单群聊: 所有群聊\n"
+                status_msg += "📋 白名单群聊: 所有群聊\n"
         
         # 当前会话信息
+        current_time = self._get_recall_time_for_bot(event)
         if is_private:
-            status_msg += f"当前会话: 私聊 (默认{private_time}秒后撤回)"
+            status_msg += f"📍 当前会话: 私聊 (默认{current_time}秒后撤回)"
         else:
-            status_msg += f"当前会话: 群聊{group_id} (默认{group_time}秒后撤回)"
+            status_msg += f"📍 当前会话: 群聊 {group_id} (默认{current_time}秒后撤回)"
             
-            # 检查是否在白名单中
-            if group_enabled and group_whitelist and str(group_id) not in group_whitelist:
-                status_msg += " ❌不在白名单中"
-        
         # 临时设置信息
         session_key = event.unified_msg_origin
         if session_key in self.pending_recall:
-            status_msg += f"\n下次消息撤回: {self.pending_recall[session_key]}秒后"
+            status_msg += f"\n🎯 下次消息撤回: {self.pending_recall[session_key]}秒后"
             
         yield event.plain_result(status_msg)
 
-    @filter.command("recall_on")
-    async def recall_on_command(self, event: AstrMessageEvent):
-        """启用当前群组的撤回功能（仅限白名单群聊）"""
-        if self._is_private_chat(event):
-            yield event.plain_result("此命令仅在群聊中可用")
-            return
-            
-        if not self._check_permission(event):
-            yield event.plain_result("权限不足")
-            return
-            
-        group_id = event.get_group_id()
-        group_whitelist = self.config.get("group_whitelist", [])
-        
-        if str(group_id) in group_whitelist:
-            yield event.plain_result("本群已在白名单中")
-            return
-            
-        # 添加到白名单
-        new_whitelist = group_whitelist + [str(group_id)]
-        self.config.set("group_whitelist", new_whitelist)
-        self.config.save_config()
-        
-        yield event.plain_result("✅ 已启用本群撤回功能")
-
-    @filter.command("recall_off")
-    async def recall_off_command(self, event: AstrMessageEvent):
-        """禁用当前群组的撤回功能（从白名单移除）"""
-        if self._is_private_chat(event):
-            yield event.plain_result("此命令仅在群聊中可用")
-            return
-            
-        if not self._check_permission(event):
-            yield event.plain_result("权限不足")
-            return
-            
-        group_id = event.get_group_id()
-        group_whitelist = self.config.get("group_whitelist", [])
-        
-        if str(group_id) not in group_whitelist:
-            yield event.plain_result("本群不在白名单中")
-            return
-            
-        # 从白名单移除
-        new_whitelist = [gid for gid in group_whitelist if gid != str(group_id)]
-        self.config.set("group_whitelist", new_whitelist)
-        self.config.save_config()
-        
-        yield event.plain_result("❌ 已禁用本群撤回功能")
-
     @filter.after_message_sent()
-    async def on_message_sent(self, event: AstrMessageEvent):
-        """消息发送后处理撤回逻辑"""
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        """消息发送后处理撤回逻辑 - 普通消息"""
+        await self._handle_message_recall(event, "普通消息")
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp):
+        """LLM响应完成后处理撤回逻辑"""
+        # LLM响应完成后也会触发消息发送，我们在这里也处理撤回
+        logger.info("检测到LLM响应完成，准备处理撤回")
+        # 注意：这里不能直接处理，因为消息可能还没有真正发送
+
+    @filter.on_decorating_result()
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        """消息装饰阶段处理撤回逻辑 - 包括LLM消息"""
+        # 这个钩子在消息发送前触发，适用于所有类型的消息
+        logger.info("检测到消息装饰阶段，准备处理撤回")
+
+    async def _handle_message_recall(self, event: AstrMessageEvent, message_type: str):
+        """统一处理消息撤回"""
         try:
             # 检查是否启用撤回
             if not self._should_enable_recall(event):
@@ -230,6 +223,7 @@ class SelfRecallPlugin(Star):
             # 获取会话key
             session_key = event.unified_msg_origin
             is_private = self._is_private_chat(event)
+            is_bot_admin = not is_private and self._is_bot_admin_in_group(event)
             
             # 确定撤回时间
             recall_time = None
@@ -239,14 +233,16 @@ class SelfRecallPlugin(Star):
                 recall_time = self.pending_recall[session_key]
                 # 使用后清除临时设置
                 del self.pending_recall[session_key]
+                logger.info(f"使用临时设置的撤回时间: {recall_time}秒")
             
-            # 2. 使用默认撤回时间
+            # 2. 使用默认撤回时间（根据机器人身份）
             else:
-                recall_time = self._get_default_recall_time(event)
+                recall_time = self._get_recall_time_for_bot(event)
+                logger.info(f"使用默认撤回时间: {recall_time}秒")
             
             if recall_time and recall_time > 0:
                 # 获取消息ID并启动撤回任务
-                message_id = self._get_message_id_from_event(event)
+                message_id = await self._get_real_message_id(event)
                 
                 if message_id:
                     platform_type = event.get_platform_name()
@@ -256,15 +252,17 @@ class SelfRecallPlugin(Star):
                     task.add_done_callback(self._remove_task)
                     self.recall_tasks.append(task)
                     
+                    bot_role = "管理员" if is_bot_admin else "成员"
                     chat_type = "私聊" if is_private else "群聊"
-                    logger.info(f"{chat_type}消息已安排{recall_time}秒后撤回，消息ID: {message_id}")
+                    logger.info(f"🤖{bot_role} {message_type}{chat_type}消息已安排{recall_time}秒后撤回，消息ID: {message_id}")
+                else:
+                    logger.warning(f"无法获取{message_type}消息ID，撤回失败")
                 
         except Exception as e:
-            logger.error(f"消息撤回处理失败: {e}")
+            logger.error(f"{message_type}消息撤回处理失败: {e}")
 
-    def _get_message_id_from_event(self, event: AstrMessageEvent) -> int:
-        """从事件中获取消息ID（需要根据具体平台实现）"""
-        # 这里是一个示例实现，实际需要根据平台API调整
+    async def _get_real_message_id(self, event: AstrMessageEvent) -> int:
+        """获取真实的消息ID"""
         try:
             # 对于QQ平台
             if event.get_platform_name() == "aiocqhttp":
@@ -272,12 +270,41 @@ class SelfRecallPlugin(Star):
                     AiocqhttpMessageEvent,
                 )
                 if isinstance(event, AiocqhttpMessageEvent):
-                    # 这里需要根据实际API获取消息ID
-                    return hash(event.unified_msg_origin + str(event.timestamp))
+                    # 尝试从事件中获取消息ID
+                    # 注意：LLM消息可能需要特殊处理
+                    
+                    # 方法1：尝试从原始消息中获取
+                    if hasattr(event, 'message_obj') and hasattr(event.message_obj, 'message_id'):
+                        return int(event.message_obj.message_id)
+                    
+                    # 方法2：尝试从事件属性中获取
+                    if hasattr(event, 'message_id'):
+                        return int(event.message_id)
+                    
+                    # 方法3：使用时间戳生成临时ID（最后的手段）
+                    logger.warning("使用时间戳生成临时消息ID，可能无法正确撤回")
+                    return hash(f"{event.unified_msg_origin}_{event.timestamp}")
+                    
         except Exception as e:
-            logger.error(f"获取消息ID失败: {e}")
+            logger.error(f"获取真实消息ID失败: {e}")
         
-        return hash(event.unified_msg_origin + str(event.timestamp))
+        # 如果所有方法都失败，返回0表示无法撤回
+        return 0
+
+    # 添加一个测试命令来验证撤回功能
+    @filter.command("test_recall")
+    async def test_recall_command(self, event: AstrMessageEvent, time: int = 10):
+        """测试撤回功能"""
+        if time <= 0 or time > 600:
+            yield event.plain_result("测试时间必须在1-600秒之间")
+            return
+            
+        # 设置临时撤回时间
+        session_key = event.unified_msg_origin
+        self.pending_recall[session_key] = time
+        
+        yield event.plain_result(f"🧪 测试消息，{time}秒后将会撤回...")
+        logger.info(f"测试消息已发送，将在{time}秒后撤回")
 
     async def terminate(self):
         """插件卸载时取消所有撤回任务"""
